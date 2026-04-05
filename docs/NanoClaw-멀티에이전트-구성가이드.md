@@ -429,6 +429,131 @@ xClaw 목표 (자동):
                     → 헬스체크 + 자동 복구
 ```
 
+## 공유/개별 리소스 분리 (심볼릭 링크)
+
+멀티 인스턴스에서 공유 리소스를 복사하면 드리프트가 발생한다.
+심볼릭 링크로 **단일 원본**을 참조하는 구조가 권장된다.
+
+### 컨테이너 마운트 맵
+
+```
+Docker 컨테이너 내부                    ← 호스트 소스               공유/개별
+─────────────────────────────────────────────────────────────────────────
+/workspace/group/          (rw)        ← groups/{name}/            개별
+/workspace/global/         (ro)        ← groups/global/            공유
+/workspace/project/        (ro)        ← nanoclaw/                 공유 (main만)
+/home/node/.claude/        (rw)        ← data/sessions/{name}/    개별
+/home/node/.claude/skills/ (rw)        ← container/skills/ (복사)  공유 원본
+/workspace/ipc/            (rw)        ← data/ipc/{name}/          개별
+```
+
+### 심링크 가능/불가 판정
+
+| 리소스 | 심링크 | 이유 |
+|--------|--------|------|
+| `groups/global/` | ✅ 가능 | 읽기 전용 마운트. 원본 하나를 모든 인스턴스가 참조 |
+| `container/skills/` | ✅ 가능 | 스킬 원본. 컨테이너 시작 시 세션에 복사됨 |
+| `data/certs/` | ✅ 가능 | OneCLI CA 인증서. 읽기 전용 |
+| `container/agent-runner/` | ⚠️ 불필요 | Docker 이미지에 포함. 이미지 자체가 공유 |
+| `groups/{name}/` | ❌ 불가 | 에이전트별 독립 성격/메모리 |
+| `store/messages.db` | ❌ 불가 | SQLite 동시 쓰기 불가 |
+| `data/sessions/` | ❌ 불가 | 세션 격리 필수 |
+| `.env` | ❌ 불가 | 인스턴스별 다른 봇 토큰 |
+
+### 권장 디렉토리 구조 (심링크 적용)
+
+```
+~/Project/xclaw/
+├── nanoclaw-shared/                     # ★ 공유 리소스 (단일 원본)
+│   ├── global/                          #   공유 지침
+│   │   └── CLAUDE.md                    #   모든 에이전트가 읽는 공통 규칙
+│   ├── skills/                          #   공유 스킬
+│   │   ├── agent-browser/
+│   │   ├── capabilities/
+│   │   ├── slack-formatting/
+│   │   └── status/
+│   └── certs/                           #   공유 인증서
+│       └── onecli-ca.pem
+│
+├── nanoclaw/                            # 인스턴스 A: Nano
+│   ├── groups/
+│   │   ├── global → ../../nanoclaw-shared/global       ← 심링크
+│   │   └── slack_xclaw/CLAUDE.md                        ← 개별
+│   ├── container/
+│   │   └── skills → ../../nanoclaw-shared/skills        ← 심링크
+│   ├── data/certs → ../../nanoclaw-shared/certs         ← 심링크
+│   ├── .env                                              ← 개별
+│   └── store/messages.db                                 ← 개별
+│
+├── nanoclaw-jarvis/                     # 인스턴스 B: Jarvis
+│   ├── groups/
+│   │   ├── global → ../../nanoclaw-shared/global       ← 심링크
+│   │   └── slack_jarvis-dev/CLAUDE.md                   ← 개별
+│   ├── container/
+│   │   └── skills → ../../nanoclaw-shared/skills        ← 심링크
+│   ├── data/certs → ../../nanoclaw-shared/certs         ← 심링크
+│   ├── .env                                              ← 개별
+│   └── store/messages.db                                 ← 개별
+```
+
+### 심링크 셋업 스크립트
+
+```bash
+#!/bin/bash
+# setup-shared.sh — 공유 리소스 분리 + 심링크 생성
+SHARED=~/Project/xclaw/nanoclaw-shared
+ORIGIN=~/Project/xclaw/nanoclaw
+
+# 1. 공유 디렉토리 생성 + 원본에서 이동
+mkdir -p "$SHARED"
+cp -r "$ORIGIN/groups/global" "$SHARED/global"
+cp -r "$ORIGIN/container/skills" "$SHARED/skills"
+cp -r "$ORIGIN/data/certs" "$SHARED/certs"
+
+# 2. 원본 인스턴스에 심링크 적용
+rm -rf "$ORIGIN/groups/global"
+ln -sf "$SHARED/global" "$ORIGIN/groups/global"
+rm -rf "$ORIGIN/container/skills"
+ln -sf "$SHARED/skills" "$ORIGIN/container/skills"
+rm -rf "$ORIGIN/data/certs"
+ln -sf "$SHARED/certs" "$ORIGIN/data/certs"
+
+# 3. 추가 인스턴스에 심링크 적용
+for INST in nanoclaw-jarvis nanoclaw-trader; do
+  DIR=~/Project/xclaw/$INST
+  [ ! -d "$DIR" ] && continue
+  rm -rf "$DIR/groups/global"
+  ln -sf "$SHARED/global" "$DIR/groups/global"
+  rm -rf "$DIR/container/skills"
+  ln -sf "$SHARED/skills" "$DIR/container/skills"
+  mkdir -p "$DIR/data"
+  rm -rf "$DIR/data/certs"
+  ln -sf "$SHARED/certs" "$DIR/data/certs"
+  echo "✅ $INST linked"
+done
+```
+
+### MCP 서버 공유
+
+현재 MCP 설정은 `container/agent-runner/src/index.ts`에 하드코딩되어 있고,
+Docker 이미지(`nanoclaw-agent:latest`)에 빌드된다.
+
+**모든 인스턴스가 같은 이미지를 사용하므로 MCP는 자동 공유.**
+
+인스턴스별 다른 MCP가 필요하면:
+1. 인스턴스별 다른 이미지 빌드 (비효율)
+2. MCP 설정을 외부 JSON으로 분리 + 마운트 (미래 개선)
+
+### 공유 지침 편집 흐름
+
+```
+nanoclaw-shared/global/CLAUDE.md 수정
+  → 모든 인스턴스가 심링크로 즉시 반영
+  → 서비스 재시작 불필요 (다음 컨테이너 스폰 시 자동 적용)
+```
+
+개별 지침은 각 `groups/{name}/CLAUDE.md`에서 독립 편집.
+
 ## 주의사항
 
 1. **컨테이너 이름 충돌**: 각 인스턴스가 `nanoclaw-slack-{group}-{ts}` 패턴으로 컨테이너 생성. 그룹명이 다르면 충돌 없음
